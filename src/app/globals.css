@@ -1,4 +1,53 @@
-@import "tailwindcss";
+@import '@solana/wallet-adapter-react-ui/styles.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom styles for wallet button */
+.wallet-adapter-button-trigger {
+  background-color: #512da8;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+}
+
+.wallet-adapter-button-trigger:hover {
+  background-color: #673ab7;
+}
+
+.wallet-adapter-button {
+  background-color: transparent !important;
+  border: none !important;
+  color: white !important;
+  font-weight: 500 !important;
+  padding: 0.5rem 1rem !important;
+  height: auto !important;
+  line-height: 1.5 !important;
+}
+
+.wallet-adapter-button:not([disabled]):hover {
+  background-color: transparent !important;
+  opacity: 0.9;
+}
+
+.wallet-adapter-modal-wrapper {
+  background-color: #1a1a1a !important;
+}
+
+.wallet-adapter-modal-button-close {
+  background-color: #512da8 !important;
+}
+
+.wallet-adapter-modal-button-close:hover {
+  background-color: #673ab7 !important;
+}
+
+.wallet-adapter-modal-list-more {
+  color: #512da8 !important;
+}
+
+.wallet-adapter-modal-list-more:hover {
+  color: #673ab7 !important;
+}
 
 :root {
   --background: #ffffff;
