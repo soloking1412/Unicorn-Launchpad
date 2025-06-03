@@ -4,6 +4,7 @@ import "./globals.css";
 import { Providers } from "./providers";
 import Link from "next/link";
 import { WalletConnectButton } from "@/components/WalletConnectButton";
+import { Toaster } from 'react-hot-toast';
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -32,6 +33,7 @@ export default function RootLayout({
             </nav>
             {children}
           </div>
+          <Toaster />
         </Providers>
       </body>
     </html>
