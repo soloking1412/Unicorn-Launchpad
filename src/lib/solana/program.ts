@@ -2,16 +2,34 @@ import { AnchorProvider } from '@project-serum/anchor';
 import { PublicKey, SystemProgram, TransactionInstruction, Keypair, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, getAssociatedTokenAddress, createInitializeMintInstruction, MINT_SIZE, createAssociatedTokenAccountInstruction, ASSOCIATED_TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
-// Project account size
+// Account sizes (based on Rust program)
 const PROJECT_ACCOUNT_SIZE = 32 + // authority
-  32 + // name
-  8 + // symbol
+  32 + // name (max 32 bytes)
+  8 + // symbol (max 8 bytes)
   8 + // funding_goal
   8 + // total_raised
   8 + // token_price
   1 + // is_active
   1 + // bump
-  32; // token_mint
+  32 + // token_mint
+  1 + // milestone_count
+  1; // proposal_count
+
+const PROPOSAL_ACCOUNT_SIZE = 32 + // creator
+  32 + // title (max 32 bytes)
+  256 + // description (max 256 bytes)
+  1 + // milestone_id
+  8 + // yes_votes
+  8 + // no_votes
+  1 + // is_executed
+  8 + // created_at
+  8; // voting_end
+
+const MILESTONE_ACCOUNT_SIZE = 32 + // title (max 32 bytes)
+  256 + // description (max 256 bytes)
+  8 + // amount
+  1 + // is_completed
+  8; // completed_at
 
 // Temporary interface until we generate the IDL
 interface Project {
@@ -23,6 +41,29 @@ interface Project {
   tokenPrice: number;
   isActive: boolean;
   tokenMintAddress: PublicKey;
+  proposalCount: number;
+  milestoneCount: number;
+}
+
+export interface Proposal {
+  creator: PublicKey;
+  title: string;
+  description: string;
+  milestoneId: number;
+  yesVotes: number;
+  noVotes: number;
+  isExecuted: boolean;
+  createdAt: number;
+  votingEnd: number;
+}
+
+export interface Milestone {
+  title: string;
+  description: string;
+  amount: number;
+  isCompleted: boolean;
+  completedAt: number;
+  hasProposal: boolean;
 }
 
 export class UnicornFactoryClient {
@@ -244,6 +285,14 @@ export class UnicornFactoryClient {
     const tokenMintAddress = new PublicKey(data.slice(offset, offset + 32));
     offset += 32;
 
+    // Parse milestone_count (1 byte)
+    const milestoneCount = data[offset];
+    offset += 1;
+
+    // Parse proposal_count (1 byte)
+    const proposalCount = data[offset];
+    offset += 1;
+
     console.log('Parsed project:', {
       authority: authority.toString(),
       name,
@@ -254,6 +303,8 @@ export class UnicornFactoryClient {
       isActive,
       bump,
       tokenMintAddress: tokenMintAddress.toString(),
+      milestoneCount,
+      proposalCount,
     });
 
     return {
@@ -265,6 +316,8 @@ export class UnicornFactoryClient {
       tokenPrice,
       isActive,
       tokenMintAddress,
+      proposalCount,
+      milestoneCount,
     };
   }
 
@@ -277,37 +330,136 @@ export class UnicornFactoryClient {
   }
 
   async getAllProjects(): Promise<Project[]> {
+    console.log('Fetching all projects...');
     try {
-      // Get all program accounts
-      const accounts = await this.provider.connection.getProgramAccounts(
-        this.programId,
-        {
-          commitment: 'confirmed',
-          filters: [ /* Removed dataSize filter */ ],
+        // Get all accounts owned by the program
+        const accounts = await this.provider.connection.getProgramAccounts(
+            this.programId,
+            {
+                commitment: 'confirmed',
+                // We will filter client-side to find Project accounts
+            }
+        );
+
+        console.log(`Found ${accounts.length} program accounts. Attempting to filter for projects.`);
+
+        const projects: Project[] = [];
+
+        for (const account of accounts) {
+            // A project account has a specific structure starting with the authority's public key.
+            // We can try to unpack the account as a Project and validate if it looks like one.
+            // A more robust method would involve an account type discriminant byte in the Rust program,
+            // but for now, we'll rely on unpacking and structural checks.
+            if (account.account.data.length >= PROJECT_ACCOUNT_SIZE) { // Check minimum size
+                try {
+                    const potentialProject = this.unpackProject(account.account.data);
+                    
+                    // Basic heuristic check: Can the authority be derived back to this PDA?
+                    // This is not foolproof but helps filter out non-project accounts.
+                    const [expectedProjectPda, _bump] = await PublicKey.findProgramAddress(
+                        [Buffer.from('project'), potentialProject.authority.toBuffer()],
+                        this.programId
+                    );
+
+                    if (expectedProjectPda.equals(account.pubkey)) {
+                         // Also check if the unpacked bump matches the derived bump
+                        // This requires adding bump to the unpackProject helper
+                        // For simplicity now, we just rely on PDA derivation match
+
+                        projects.push({
+                            authority: potentialProject.authority,
+                            name: potentialProject.name,
+                            symbol: potentialProject.symbol,
+                            fundingGoal: potentialProject.fundingGoal,
+                            totalRaised: potentialProject.totalRaised,
+                            tokenPrice: potentialProject.tokenPrice,
+                            isActive: potentialProject.isActive,
+                            tokenMintAddress: potentialProject.tokenMintAddress,
+                            proposalCount: potentialProject.proposalCount,
+                            milestoneCount: potentialProject.milestoneCount,
+                        });
+                    } else {
+                       // console.log(`Account ${account.pubkey.toString()} is not a project PDA.`);
+                    }
+                   
+                } catch (error) {
+                    // Account data doesn't match Project structure, ignore.
+                    // console.log(`Failed to unpack account ${account.pubkey.toString()} as Project:`, error);
+                }
+            }
         }
-      );
 
-      console.log('Found accounts:', accounts.length);
+        console.log(`Successfully identified ${projects.length} project accounts.`);
+        return projects;
 
-      // Parse each account into a Project
-      const projects = await Promise.all(
-        accounts.map(async (account) => {
-          try {
-            const project = await this.getProject(account.pubkey);
-            return project;
-          } catch (err) {
-            console.error('Error parsing project:', err);
-            return null;
-          }
-        })
-      );
-
-      // Filter out any null projects (failed to parse)
-      return projects.filter((project): project is Project => project !== null);
     } catch (error) {
-      console.error('Error fetching all projects:', error);
-      throw error;
+        console.error('Error fetching all projects:', error);
+        throw error;
     }
+  }
+
+  // Helper function to unpack Project data
+  private unpackProject(data: Buffer): Project {
+        let offset = 0;
+
+        // Unpack authority (32 bytes)
+        const authority = new PublicKey(data.slice(offset, offset + 32));
+        offset += 32;
+        
+        // Unpack name (32 bytes, potentially zero-padded)
+        const nameBytes = data.slice(offset, offset + 32);
+        const name = new TextDecoder().decode(nameBytes).replace(/\0/g, ''); // Remove null characters
+        offset += 32;
+        
+        // Unpack symbol (8 bytes, potentially zero-padded)
+        const symbolBytes = data.slice(offset, offset + 8);
+        const symbol = new TextDecoder().decode(symbolBytes).replace(/\0/g, ''); // Remove null characters
+        offset += 8;
+        
+        // Unpack funding goal (8 bytes)
+        const fundingGoal = Number(data.readBigUInt64LE(offset));
+        offset += 8;
+        
+        // Unpack total raised (8 bytes)
+        const totalRaised = Number(data.readBigUInt64LE(offset));
+        offset += 8;
+        
+        // Unpack token price (8 bytes)
+        const tokenPrice = Number(data.readBigUInt64LE(offset));
+        offset += 8;
+        
+        // Unpack is_active (1 byte)
+        const isActive = Boolean(data[offset]);
+        offset += 1;
+        
+        // Unpack bump (1 byte)
+        const bump = data[offset]; // Keep bump to potentially add validation later
+        offset += 1;
+
+        // Unpack token_mint (32 bytes)
+        const tokenMintAddress = new PublicKey(data.slice(offset, offset + 32));
+        offset += 32;
+
+        // Unpack milestone_count (1 byte)
+        const milestoneCount = data[offset];
+        offset += 1;
+
+        // Unpack proposal_count (1 byte)
+        const proposalCount = data[offset];
+        offset += 1; // Ensure offset matches total size
+
+        return {
+            authority,
+            name,
+            symbol,
+            fundingGoal,
+            totalRaised,
+            tokenPrice,
+            isActive,
+            tokenMintAddress,
+            proposalCount,
+            milestoneCount,
+        };
   }
 
   async buyTokens(projectPda: PublicKey, amount: number): Promise<string> {
@@ -435,13 +587,6 @@ export class UnicornFactoryClient {
       // Create transaction with compute budget
       const transaction = new Transaction();
       
-      // Add compute budget instruction FIRST
-      transaction.add(
-        ComputeBudgetProgram.setComputeUnitLimit({
-          units: 400_000, // Increase from default ~200k to 400k
-        })
-      );
-      
       // Then add your existing instruction
       transaction.add(instruction);
 
@@ -481,5 +626,640 @@ export class UnicornFactoryClient {
       
       throw error;
     }
+  }
+
+  async createProposal(
+    projectPda: PublicKey,
+    title: string,
+    description: string,
+    milestoneId: number
+  ): Promise<string> {
+    console.log('Creating proposal...');
+    console.log('Project PDA:', projectPda.toString());
+    console.log('Title:', title);
+    console.log('Description:', description);
+    console.log('Milestone ID:', milestoneId);
+
+    // Fetch the project to get the current proposal count
+    const project = await this.getProject(projectPda);
+    const proposalIndex = project.proposalCount;
+
+    // Find the PDA for the new proposal account
+    const [proposalAccountPda, proposalBump] = await PublicKey.findProgramAddress(
+      [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalIndex])],
+      this.programId
+    );
+    console.log('Proposal PDA:', proposalAccountPda.toString());
+
+    // Find PDA for the milestone account
+    const [milestonePda, milestoneBump] = await PublicKey.findProgramAddress(
+      [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([milestoneId])],
+      this.programId
+    );
+    console.log('Milestone PDA:', milestonePda.toString());
+
+    // Encode strings to UTF-8 bytes
+    const titleBytes = new TextEncoder().encode(title);
+    const descriptionBytes = new TextEncoder().encode(description);
+
+    // Create instruction data buffer with correct size
+    const data = Buffer.alloc(4 + 4 + titleBytes.length + descriptionBytes.length + 1);
+    let offset = 0;
+
+    // Write title length (u32)
+    data.writeUInt32LE(titleBytes.length, offset);
+    offset += 4;
+
+    // Write description length (u32)
+    data.writeUInt32LE(descriptionBytes.length, offset);
+    offset += 4;
+
+    // Write title bytes (variable length)
+    data.set(titleBytes, offset);
+    offset += titleBytes.length;
+
+    // Write description bytes (variable length)
+    data.set(descriptionBytes, offset);
+    offset += descriptionBytes.length;
+
+    // Write milestone_id (u8)
+    data.writeUInt8(milestoneId, offset);
+
+    const instruction = new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: projectPda, isSigner: false, isWritable: true },
+        { pubkey: proposalAccountPda, isSigner: false, isWritable: true },
+        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: true },
+        { pubkey: milestonePda, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      ],
+      data: Buffer.from([4, ...data]), // 4 is the instruction index
+    });
+
+    console.log('Instruction prepared:', {
+      programId: instruction.programId.toString(),
+      keys: instruction.keys.map(key => ({
+        pubkey: key.pubkey.toString(),
+        isSigner: key.isSigner,
+        isWritable: key.isWritable
+      })),
+      dataLength: instruction.data.length
+    });
+
+    try {
+      console.log('Sending transaction...');
+      // Send ONLY the instruction - let Rust create the account
+      const tx = await this.provider.sendAndConfirm(
+        new Transaction().add(instruction)
+      );
+      console.log('Transaction successful:', tx);
+      return tx;
+    } catch (error) {
+      console.error('Transaction failed:', error);
+      throw error;
+    }
+  }
+
+  // FIXED: Vote function - consistent with Rust contract
+  async vote(
+    projectPda: PublicKey,
+    proposalId: number,
+    vote: boolean
+  ): Promise<string> {
+    console.log('Voting on proposal...');
+    console.log('Project PDA:', projectPda.toString());
+    console.log('Proposal ID:', proposalId);
+    console.log('Vote (true for yes, false for no):', vote);
+
+    // FIXED: Use single byte like create_proposal (not 8-byte buffer)
+    const [proposalAccountPda, proposalBump] = await PublicKey.findProgramAddress(
+        [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalId])],
+        this.programId
+    );
+    console.log('Proposal PDA:', proposalAccountPda.toString());
+
+    const data = Buffer.alloc(9); // 8 bytes for proposal ID + 1 byte for vote
+    data.writeBigUInt64LE(BigInt(proposalId), 0);
+    data.writeUInt8(vote ? 1 : 0, 8);
+
+    const instruction = new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: projectPda, isSigner: false, isWritable: false }, // Project account (Readonly)
+        { pubkey: proposalAccountPda, isSigner: false, isWritable: true }, // Proposal account (PDA - writable to update votes)
+        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: false }, // Voter account (Signer, Readonly)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System program
+      ],
+      data: Buffer.from([5, ...data]), // 5 is the instruction index for vote
+    });
+
+    console.log('Instruction prepared:', {
+      programId: instruction.programId.toString(),
+      keys: instruction.keys.map(key => ({
+        pubkey: key.pubkey.toString(),
+        isSigner: key.isSigner,
+        isWritable: key.isWritable
+      })),
+      dataLength: instruction.data.length
+    });
+
+    try {
+      console.log('Sending transaction...');
+      const tx = await this.provider.sendAndConfirm(
+        new Transaction().add(instruction)
+      );
+      console.log('Transaction successful:', tx);
+      return tx;
+    } catch (error: any) {
+      console.error('Transaction failed:', error);
+      if (error.logs) {
+        console.error('Transaction logs:', error.logs);
+      }
+      throw error;
+    }
+  }
+
+  // ReleaseFunds function - consistent with Rust contract
+  async releaseFunds(
+    projectPda: PublicKey,
+    proposalId: number,
+    milestonePda: PublicKey
+  ): Promise<string> {
+    console.log('Releasing funds for proposal...');
+    console.log('Project PDA:', projectPda.toString());
+    console.log('Proposal ID:', proposalId);
+    console.log('Milestone PDA:', milestonePda.toString());
+
+    // Use single byte for proposal ID in PDA derivation
+    const [proposalAccountPda, proposalBump] = await PublicKey.findProgramAddress(
+        [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalId])],
+        this.programId
+    );
+    console.log('Proposal PDA:', proposalAccountPda.toString());
+
+    // Instruction data contains proposal ID as u64 (8 bytes)
+    const data = Buffer.alloc(8);
+    data.writeBigUInt64LE(BigInt(proposalId), 0);
+
+    const instruction = new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: projectPda, isSigner: false, isWritable: true }, // Project account (PDA - writable to send SOL)
+        { pubkey: proposalAccountPda, isSigner: false, isWritable: true }, // Proposal account (PDA - writable to mark as executed)
+        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: true }, // Authority account (Signer, writable to receive SOL)
+        { pubkey: milestonePda, isSigner: false, isWritable: true }, // Milestone account (PDA - writable to update has_proposal flag)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System program
+      ],
+      data: Buffer.from([6, ...data]), // 6 is the instruction index for release funds
+    });
+
+    console.log('Instruction prepared:', {
+      programId: instruction.programId.toString(),
+      keys: instruction.keys.map(key => ({
+        pubkey: key.pubkey.toString(),
+        isSigner: key.isSigner,
+        isWritable: key.isWritable
+      })),
+      dataLength: instruction.data.length
+    });
+
+    try {
+      console.log('Sending transaction...');
+      const tx = await this.provider.sendAndConfirm(
+        new Transaction().add(instruction),
+        [],
+        {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+          commitment: 'confirmed'
+        }
+      );
+      console.log('Transaction successful:', tx);
+      return tx;
+    } catch (error: any) {
+      console.error('Transaction failed:', error);
+      if (error.logs) {
+        console.error('Transaction logs:', error.logs);
+      }
+      throw error;
+    }
+  }
+
+  async addMilestone(
+    projectPda: PublicKey,
+    milestoneIndex: number,
+    title: string,
+    description: string,
+    amount: number
+  ): Promise<string> {
+    console.log('Adding milestone...');
+
+    // Find the PDA for the new milestone account
+    const [milestoneAccountPda, milestoneBump] = await PublicKey.findProgramAddress(
+        [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([milestoneIndex])],
+        this.programId
+    );
+    console.log('Milestone PDA:', milestoneAccountPda.toString());
+
+    // Convert strings to UTF-8 bytes
+    const titleBytes = new TextEncoder().encode(title);
+    const descriptionBytes = new TextEncoder().encode(description);
+
+    // Create instruction data buffer
+    const data = Buffer.alloc(4 + 4 + 24 + titleBytes.length + descriptionBytes.length + 8);
+    let offset = 0;
+
+    // Write title length (u32)
+    data.writeUInt32LE(titleBytes.length, offset);
+    offset += 4;
+
+    // Write description length (u32)
+    data.writeUInt32LE(descriptionBytes.length, offset);
+    offset += 4;
+
+    // Add 24 bytes of padding to match Rust program's expected offset
+    offset += 24;
+
+    // Write title bytes
+    data.set(titleBytes, offset);
+    offset += titleBytes.length;
+
+    // Write description bytes
+    data.set(descriptionBytes, offset);
+    offset += descriptionBytes.length;
+
+    // Write amount (u64)
+    const amountBuffer = Buffer.alloc(8);
+    amountBuffer.writeBigUInt64LE(BigInt(amount));
+    data.set(amountBuffer, offset);
+
+    const instruction = new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: projectPda, isSigner: false, isWritable: true }, // Project account (PDA) - Index 0
+        { pubkey: milestoneAccountPda, isSigner: false, isWritable: true }, // Milestone account (PDA) - Index 1
+        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: true }, // Authority account (Signer) - Index 2
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System program - Index 3
+      ],
+      data: Buffer.from([7, ...data]), // 7 is the instruction index for add milestone
+    });
+
+    console.log('Instruction prepared:', {
+      programId: instruction.programId.toString(),
+      keys: instruction.keys.map(key => ({
+        pubkey: key.pubkey.toString(),
+        isSigner: key.isSigner,
+        isWritable: key.isWritable
+      })),
+      dataLength: instruction.data.length
+    });
+
+    try {
+      console.log('Sending transaction...');
+      const tx = await this.provider.sendAndConfirm(
+        new Transaction().add(instruction)
+      );
+      console.log('Transaction successful:', tx);
+      return tx;
+    } catch (error: any) {
+      console.error('Transaction failed:', error);
+      if (error.logs) {
+        console.error('Transaction logs:', error.logs);
+      }
+      throw error;
+    }
+  }
+
+  async completeMilestone(
+    projectPda: PublicKey,
+    milestoneId: number
+  ): Promise<string> {
+    console.log('Completing milestone...');
+
+    // Find the PDA for the milestone account
+    const [milestoneAccountPda, milestoneBump] = await PublicKey.findProgramAddress(
+        [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([milestoneId])],
+        this.programId
+    );
+    console.log('Milestone PDA:', milestoneAccountPda.toString());
+
+    const data = Buffer.alloc(1);
+    data.writeUInt8(milestoneId, 0);
+
+    const instruction = new TransactionInstruction({
+      programId: this.programId,
+      keys: [
+        { pubkey: projectPda, isSigner: false, isWritable: false }, // Project account (Readonly, not modified by this instruction)
+        { pubkey: milestoneAccountPda, isSigner: false, isWritable: true }, // Milestone account (PDA)
+        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: false }, // Authority account (Signer, not modified)
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System program
+      ],
+      data: Buffer.from([8, ...data]), // 8 is the instruction index for complete milestone
+    });
+
+    console.log('Instruction prepared:', {
+      programId: instruction.programId.toString(),
+      keys: instruction.keys.map(key => ({
+        pubkey: key.pubkey.toString(),
+        isSigner: key.isSigner,
+        isWritable: key.isWritable
+      })),
+      dataLength: instruction.data.length
+    });
+
+    try {
+      console.log('Sending transaction...');
+      const tx = await this.provider.sendAndConfirm(
+        new Transaction().add(instruction)
+      );
+      console.log('Transaction successful:', tx);
+      return tx;
+    } catch (error: any) {
+      console.error('Transaction failed:', error);
+      if (error.logs) {
+        console.error('Transaction logs:', error.logs);
+      }
+      throw error;
+    }
+  }
+
+  // FIXED: GetProposal function - consistent with Rust contract
+  async getProposal(projectPda: PublicKey, proposalId: number): Promise<Proposal> {
+    console.log('Fetching proposal...');
+    console.log('Project PDA:', projectPda.toString());
+    console.log('Proposal ID:', proposalId);
+
+    // FIXED: Use single byte like create_proposal (not 8-byte buffer)
+    const [proposalAccountPda, _bump] = await PublicKey.findProgramAddress(
+        [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalId])],
+        this.programId
+    );
+    console.log('Proposal PDA:', proposalAccountPda.toString());
+
+    const accountInfo = await this.provider.connection.getAccountInfo(proposalAccountPda);
+    if (!accountInfo) {
+      console.error('Account info not found for Proposal PDA:', proposalAccountPda.toString());
+      throw new Error('Proposal not found');
+    }
+    console.log('Proposal Account Data Length:', accountInfo.data.length);
+
+    // Parse account data according to the Proposal struct layout
+    const data = accountInfo.data;
+    let offset = 0;
+
+    // Parse creator (32 bytes)
+    const creator = new PublicKey(data.slice(offset, offset + 32));
+    offset += 32;
+    
+    // Parse title (32 bytes)
+    const title = new TextDecoder().decode(data.slice(offset, offset + 32)).replace(/\0/g, '');
+    offset += 32;
+    
+    // Parse description (256 bytes)
+    const description = new TextDecoder().decode(data.slice(offset, offset + 256)).replace(/\0/g, '');
+    offset += 256;
+    
+    // Parse milestone ID (1 byte)
+    const milestoneId = data[offset];
+    offset += 1;
+    
+    // Parse yes votes (8 bytes)
+    const yesVotes = Number(data.readBigUInt64LE(offset));
+    offset += 8;
+    
+    // Parse no votes (8 bytes)
+    const noVotes = Number(data.readBigUInt64LE(offset));
+    offset += 8;
+    
+    // Parse is executed (1 byte)
+    const isExecuted = Boolean(data[offset]);
+    offset += 1;
+    
+    // Parse created at (8 bytes)
+    const createdAt = Number(data.readBigInt64LE(offset));
+    offset += 8;
+    
+    console.log(`Debug: Before votingEnd check - offset: ${offset}, data.length: ${data.length}`);
+
+    // Conditionally unpack votingEnd if buffer has enough bytes
+    let votingEnd: number;
+    if (offset + 8 <= data.length) {
+        votingEnd = Number(data.readBigInt64LE(offset));
+    } else {
+        votingEnd = 0; // Default value if votingEnd field is missing
+    }
+
+    console.log('Parsed proposal:', {
+        creator: creator.toString(),
+        title,
+        description,
+        milestoneId,
+        yesVotes,
+        noVotes,
+        isExecuted,
+        createdAt,
+        votingEnd,
+    });
+
+    return {
+      creator,
+      title,
+      description,
+      milestoneId,
+      yesVotes,
+      noVotes,
+      isExecuted,
+      createdAt,
+      votingEnd,
+    };
+  }
+
+  async getMilestone(projectPda: PublicKey, milestoneId: number): Promise<Milestone> {
+    console.log('Fetching milestone...');
+    console.log('Project PDA:', projectPda.toString());
+    console.log('Milestone ID:', milestoneId);
+
+    // Find the PDA for the specific milestone account
+    const [milestoneAccountPda, _bump] = await PublicKey.findProgramAddress(
+        [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([milestoneId])],
+        this.programId
+    );
+    console.log('Milestone PDA:', milestoneAccountPda.toString());
+
+    const accountInfo = await this.provider.connection.getAccountInfo(milestoneAccountPda);
+    if (!accountInfo) {
+        console.error('Account info not found for Milestone PDA:', milestoneAccountPda.toString());
+      throw new Error('Milestone not found');
+    }
+
+    // Parse account data according to the Milestone struct layout
+    const data = accountInfo.data;
+    let offset = 0;
+
+    // Parse title (32 bytes)
+    const title = new TextDecoder().decode(data.slice(offset, offset + 32)).replace(/\0/g, '');
+    offset += 32;
+    
+    // Parse description (256 bytes)
+    const description = new TextDecoder().decode(data.slice(offset, offset + 256)).replace(/\0/g, '');
+    offset += 256;
+    
+    // Parse amount (8 bytes)
+    const amount = Number(data.readBigUInt64LE(offset));
+    offset += 8;
+    
+    // Parse is completed (1 byte)
+    const isCompleted = Boolean(data[offset]);
+    offset += 1;
+    
+    // Parse completed at (8 bytes)
+    const completedAt = Number(data.readBigInt64LE(offset));
+    offset += 8;
+
+    // Parse has proposal (1 byte)
+    const hasProposal = Boolean(data[offset]);
+
+    console.log('Parsed milestone:', {
+        title,
+        description,
+        amount,
+        isCompleted,
+        completedAt,
+        hasProposal,
+    });
+
+    return {
+      title,
+      description,
+      amount,
+      isCompleted,
+      completedAt,
+      hasProposal,
+    };
+  }
+
+  async getAllProposals(): Promise<Proposal[]> {
+    console.log('Fetching all proposals...');
+    try {
+        // Get all accounts owned by the program
+        const accounts = await this.provider.connection.getProgramAccounts(
+            this.programId,
+            {
+                commitment: 'confirmed',
+                // Consider adding filters if needed, e.g., based on data size or a specific tag
+            }
+        );
+
+        console.log(`Found ${accounts.length} program accounts. Attempting to parse proposals.`);
+
+        const proposals: Proposal[] = [];
+
+        for (const account of accounts) {
+            // Attempt to parse the account data as a Proposal
+            // We check data length to filter for potential proposal accounts
+            if (account.account.data.length === PROPOSAL_ACCOUNT_SIZE) {
+                try {
+                    const proposal = this.unpackProposal(account.account.data);
+                    // Optional: Add a check here if the PDA matches the expected proposal PDA derivation
+                    // This would require knowing the project PDA and proposal ID from the account data,
+                    // which isn't directly available in the current Proposal struct.
+                    proposals.push(proposal);
+                } catch (error) {
+                    // This account is likely not a Proposal, or data is malformed
+                    // console.log(`Failed to unpack account ${account.pubkey.toString()} as Proposal:`, error);
+                }
+            } else {
+                 // console.log(`Skipping account ${account.pubkey.toString()} with data length ${account.account.data.length} (expected ${Proposal.LEN})`);
+            }
+        }
+
+        console.log(`Successfully parsed ${proposals.length} proposals.`);
+        return proposals;
+
+    } catch (error) {
+        console.error('Error fetching all proposals:', error);
+        throw error;
+    }
+  }
+
+  // Helper function to unpack Proposal data (can be made public if needed elsewhere)
+  private unpackProposal(data: Buffer): Proposal {
+        let offset = 0;
+
+        const creator = new PublicKey(data.slice(offset, offset + 32));
+        offset += 32;
+
+        const title = new TextDecoder().decode(data.slice(offset, offset + 32)).replace(/\0/g, '');
+        offset += 32;
+
+        const description = new TextDecoder().decode(data.slice(offset, offset + 256)).replace(/\0/g, '');
+        offset += 256;
+
+        const milestoneId = data[offset];
+        offset += 1;
+
+        const yesVotes = Number(data.readBigUInt64LE(offset));
+        offset += 8;
+
+        const noVotes = Number(data.readBigUInt64LE(offset));
+        offset += 8;
+
+        const isExecuted = Boolean(data[offset]);
+        offset += 1;
+
+        const createdAt = Number(data.readBigInt64LE(offset));
+        offset += 8;
+
+        // Conditionally unpack votingEnd if buffer has enough bytes
+        let votingEnd: number;
+        if (offset + 8 <= data.length) {
+            votingEnd = Number(data.readBigInt64LE(offset));
+        } else {
+            votingEnd = 0; // Default value if votingEnd field is missing
+        }
+
+        return {
+            creator,
+            title,
+            description,
+            milestoneId,
+            yesVotes,
+            noVotes,
+            isExecuted,
+            createdAt,
+            votingEnd,
+        };
+  }
+
+  // Helper function to unpack Milestone data (can be made public if needed elsewhere)
+  private unpackMilestone(data: Buffer): Milestone {
+        let offset = 0;
+
+        const title = new TextDecoder().decode(data.slice(offset, offset + 32)).replace(/\0/g, '');
+        offset += 32;
+
+        const description = new TextDecoder().decode(data.slice(offset, offset + 256)).replace(/\0/g, '');
+        offset += 256;
+
+        const amount = Number(data.readBigUInt64LE(offset));
+        offset += 8;
+
+        const isCompleted = Boolean(data[offset]);
+        offset += 1;
+
+        const completedAt = Number(data.readBigInt64LE(offset));
+        offset += 8;
+
+        const hasProposal = Boolean(data[offset]);
+
+        return {
+            title,
+            description,
+            amount,
+            isCompleted,
+            completedAt,
+            hasProposal,
+        };
   }
 }
