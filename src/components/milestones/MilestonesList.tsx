@@ -6,14 +6,9 @@ import { UnicornFactoryClient } from '@/lib/solana/program';
 import { AnchorProvider } from '@project-serum/anchor';
 import { SolanaWallet } from '@/types/wallet';
 import { PublicKey } from '@solana/web3.js';
-
-interface Milestone {
-  title: string;
-  description: string;
-  amount: number;
-  isCompleted: boolean;
-  completedAt: number;
-}
+import MilestoneCard from './MilestoneCard';
+import { toast } from 'react-hot-toast';
+import { Milestone } from '@/lib/solana/program';
 
 interface MilestonesListProps {
   projectId: string;
@@ -81,8 +76,11 @@ const MilestonesList: React.FC<MilestonesListProps> = ({ projectId }) => {
     e.preventDefault();
     if (!wallet.connected || !wallet.publicKey) {
       setError('Please connect your wallet first');
+      toast.error('Please connect your wallet first');
       return;
     }
+
+    const loadingToast = toast.loading('Adding milestone...');
 
     try {
       const provider = new AnchorProvider(
@@ -100,6 +98,8 @@ const MilestonesList: React.FC<MilestonesListProps> = ({ projectId }) => {
       const amount = parseFloat(formData.amount) * 1_000_000_000; // Convert to lamports (1e9)
       if (isNaN(amount)) {
         setError('Invalid amount entered.');
+        toast.dismiss(loadingToast);
+        toast.error('Invalid amount entered.');
         return;
       }
 
@@ -111,21 +111,29 @@ const MilestonesList: React.FC<MilestonesListProps> = ({ projectId }) => {
         amount // Pass the calculated numeric amount
       );
 
+      toast.dismiss(loadingToast);
+      toast.success('Milestone added successfully!');
+
       // Reset form and refresh milestones
       setFormData({ title: '', description: '', amount: '' });
       setShowAddForm(false);
-      fetchMilestones();
-    } catch (err) {
+      fetchMilestones(); // Reload milestones after creation
+    } catch (err: any) {
       console.error('Error adding milestone:', err);
       setError('Failed to add milestone');
+      toast.dismiss(loadingToast);
+      toast.error(`Failed to add milestone: ${err.message || String(err)}`);
     }
   };
 
   const handleCompleteMilestone = async (milestoneId: number) => {
     if (!wallet.connected || !wallet.publicKey) {
       setError('Please connect your wallet first');
+      toast.error('Please connect your wallet first');
       return;
     }
+
+    const loadingToast = toast.loading('Completing milestone...');
 
     try {
       const provider = new AnchorProvider(
@@ -137,10 +145,14 @@ const MilestonesList: React.FC<MilestonesListProps> = ({ projectId }) => {
       const projectPda = new PublicKey(projectId);
 
       await client.completeMilestone(projectPda, milestoneId);
-      fetchMilestones();
-    } catch (err) {
+      toast.dismiss(loadingToast);
+      toast.success('Milestone completed successfully!');
+      fetchMilestones(); // Reload milestones after completion
+    } catch (err: any) {
       console.error('Error completing milestone:', err);
       setError('Failed to complete milestone');
+      toast.dismiss(loadingToast);
+      toast.error(`Failed to complete milestone: ${err.message || String(err)}`);
     }
   };
 
@@ -212,36 +224,22 @@ const MilestonesList: React.FC<MilestonesListProps> = ({ projectId }) => {
         </form>
       )}
 
-      <div className="space-y-4">
-        {milestones.map((milestone, index) => (
-          <div
-            key={index}
-            className="bg-gray-800 p-4 rounded-lg shadow border border-gray-700 text-white"
-          >
-            <div className="flex justify-between items-start">
-              <div>
-                <h3 className="text-lg font-semibold">{milestone.title}</h3>
-                <p className="mt-1">{milestone.description}</p>
-                <div className="mt-2 text-sm">
-                  <p>Amount: {milestone.amount / 1e9} SOL</p>
-                  <p>Status: {milestone.isCompleted ? 'Completed' : 'Pending'}</p>
-                  {milestone.isCompleted && (
-                    <p>Completed at: {new Date(milestone.completedAt * 1000).toLocaleString()}</p>
-                  )}
-                </div>
-              </div>
-              {!milestone.isCompleted && wallet.connected && (
-                <button
-                  onClick={() => handleCompleteMilestone(index)}
-                  className="px-3 py-1 bg-green-500 text-white rounded hover:bg-green-600"
-                >
-                  Complete
-                </button>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
+      {milestones.length > 0 ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {milestones.map((milestone, index) => (
+            <MilestoneCard 
+              key={index} 
+              milestone={milestone} 
+              projectId={projectId}
+              milestoneId={index}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="text-center py-8">
+          <p className="text-gray-400">No milestones found</p>
+        </div>
+      )}
     </div>
   );
 };

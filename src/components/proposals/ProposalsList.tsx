@@ -18,7 +18,6 @@ interface Proposal {
   creator: PublicKey;
   title: string;
   description: string;
-  amount: number;
   milestoneId: number;
   yesVotes: number;
   noVotes: number;
@@ -27,10 +26,14 @@ interface Proposal {
   votingEnd: number;
 }
 
+interface ProposalWithMilestoneAmount extends Proposal {
+  milestoneAmount: number;
+}
+
 const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
   const wallet = useWallet();
   const { connection } = useConnection();
-  const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [proposals, setProposals] = useState<ProposalWithMilestoneAmount[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [userVotes, setUserVotes] = useState<Record<number, boolean>>({});
@@ -58,15 +61,19 @@ const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
       const project = await client.getProject(projectPda);
       const proposalCount = project.proposalCount;
 
-      // Fetch each proposal
-      const proposalPromises = Array.from({ length: proposalCount }, (_, i) =>
-        client.getProposal(projectPda, i)
+      // Fetch each proposal and its associated milestone amount
+      const proposalsWithMilestoneAmounts = await Promise.all(
+        Array.from({ length: proposalCount }, async (_, i) => {
+          const proposal = await client.getProposal(projectPda, i);
+          const milestone = await client.getMilestone(projectPda, proposal.milestoneId);
+          return { ...proposal, milestoneAmount: milestone.amount };
+        })
       );
-      const proposalsData = await Promise.all(proposalPromises);
-      setProposals(proposalsData);
-    } catch (err) {
+      setProposals(proposalsWithMilestoneAmounts);
+    } catch (err: any) {
       console.error('Error fetching proposals:', err);
       setError('Failed to load proposals');
+      toast.error(`Failed to load proposals: ${err.message || String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -78,6 +85,8 @@ const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
       return;
     }
 
+    const loadingToast = toast.loading('Submitting vote...');
+
     try {
       const provider = new AnchorProvider(
         connection,
@@ -88,18 +97,21 @@ const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
       const projectPda = new PublicKey(projectId);
       
       await client.vote(projectPda, proposalIndex, vote);
+      toast.dismiss(loadingToast);
       toast.success('Vote recorded successfully');
       
-      // Update local state
+      // Update local state and re-fetch proposals to get updated counts
       setProposals(prev => prev.map((p, i) => 
         i === proposalIndex 
           ? { ...p, [vote ? 'yesVotes' : 'noVotes']: p[vote ? 'yesVotes' : 'noVotes'] + 1 }
           : p
       ));
       setUserVotes(prev => ({ ...prev, [proposalIndex]: vote }));
-    } catch (err) {
+      fetchProposals(); // Reload proposals after voting
+    } catch (err: any) {
       console.error('Error voting:', err);
-      toast.error('Failed to record vote');
+      toast.dismiss(loadingToast);
+      toast.error(`Failed to record vote: ${err.message || String(err)}`);
     }
   };
 
@@ -109,6 +121,8 @@ const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
       return;
     }
 
+    const loadingToast = toast.loading('Releasing funds...');
+
     try {
       const provider = new AnchorProvider(
         connection,
@@ -117,17 +131,38 @@ const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
       );
       const client = new UnicornFactoryClient(provider);
       const projectPda = new PublicKey(projectId);
-      
-      await client.releaseFunds(projectPda, proposalIndex);
+
+      // Find the proposal to get its milestoneId
+      const proposal = proposals[proposalIndex];
+      if (!proposal) {
+          toast.dismiss(loadingToast);
+          toast.error('Proposal not found');
+          return;
+      }
+
+      console.log('handleReleaseFunds: projectPda', projectPda.toString());
+      console.log('handleReleaseFunds: proposalIndex', proposalIndex);
+      console.log('handleReleaseFunds: proposal.milestoneId', proposal.milestoneId);
+
+      // Find the milestone PDA
+      const [milestonePda, _milestoneBump] = await PublicKey.findProgramAddress(
+          [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([proposal.milestoneId])],
+          client.programId
+      );
+
+      await client.releaseFunds(projectPda, proposalIndex, milestonePda);
+      toast.dismiss(loadingToast);
       toast.success('Funds released successfully');
-      
-      // Update local state
-      setProposals(prev => prev.map((p, i) => 
+
+      // Update local state and re-fetch proposals
+      setProposals(prev => prev.map((p, i) =>
         i === proposalIndex ? { ...p, isExecuted: true } : p
       ));
-    } catch (err) {
+      fetchProposals(); // Reload proposals after fund release
+    } catch (err: any) {
       console.error('Error releasing funds:', err);
-      toast.error('Failed to release funds');
+      toast.dismiss(loadingToast);
+      toast.error(`Failed to release funds: ${err.message || String(err)}`);
     }
   };
 
@@ -165,8 +200,11 @@ const ProposalsList: React.FC<ProposalsListProps> = ({ projectId }) => {
             projectId={projectId}
             onVote={handleVote}
             canVote={wallet.connected && !proposal.isExecuted}
-            hasVoted={proposal.milestoneId in userVotes}
-            userVote={userVotes[proposal.milestoneId] ?? null}
+            hasVoted={index in userVotes}
+            userVote={userVotes[index] ?? null}
+            onReleaseFunds={handleReleaseFunds}
+            proposalId={index}
+            milestoneAmount={proposal.milestoneAmount}
           />
         </Link>
       ))}

@@ -39,7 +39,6 @@ pub enum UnicornFactoryInstruction {
     CreateProposal {
         title: String,
         description: String,
-        amount: u64,
         milestone_id: u8,
     },
     Vote {
@@ -126,7 +125,7 @@ impl UnicornFactoryInstruction {
                 let title_len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
                 let description_len = u32::from_le_bytes(rest[4..8].try_into().unwrap()) as usize;
 
-                if rest.len() < 8 + title_len + description_len + 8 {
+                if rest.len() < 8 + title_len + description_len + 1 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
@@ -135,17 +134,11 @@ impl UnicornFactoryInstruction {
                 let description = String::from_utf8(
                     rest[8 + title_len..8 + title_len + description_len].to_vec(),
                 ).map_err(|_| ProgramError::InvalidInstructionData)?;
-                let amount = u64::from_le_bytes(
-                    rest[8 + title_len + description_len..8 + title_len + description_len + 8]
-                        .try_into()
-                        .unwrap(),
-                );
-                let milestone_id = rest[8 + title_len + description_len + 8];
+                let milestone_id = rest[8 + title_len + description_len];
 
                 Ok(UnicornFactoryInstruction::CreateProposal {
                     title,
                     description,
-                    amount,
                     milestone_id,
                 })
             }
@@ -364,7 +357,6 @@ pub struct Proposal {
     pub creator: Pubkey,
     pub title: String,
     pub description: String,
-    pub amount: u64,
     pub milestone_id: u8,
     pub yes_votes: u64,
     pub no_votes: u64,
@@ -377,7 +369,6 @@ impl Proposal {
     pub const LEN: usize = 32 + // creator
         32 + // title
         256 + // description
-        8 + // amount
         1 + // milestone_id
         8 + // yes_votes
         8 + // no_votes
@@ -407,10 +398,6 @@ impl Proposal {
         desc_buffer[..len].copy_from_slice(&desc_bytes[..len]);
         dst[offset..offset + 256].copy_from_slice(&desc_buffer);
         offset += 256;
-
-        // Pack amount
-        dst[offset..offset + 8].copy_from_slice(&self.amount.to_le_bytes());
-        offset += 8;
 
         // Pack milestone_id
         dst[offset] = self.milestone_id;
@@ -458,10 +445,6 @@ impl Proposal {
             .to_string();
         offset += 256;
 
-        // Unpack amount
-        let amount = u64::from_le_bytes(src[offset..offset + 8].try_into().unwrap());
-        offset += 8;
-
         // Unpack milestone_id
         let milestone_id = src[offset];
         offset += 1;
@@ -489,7 +472,6 @@ impl Proposal {
             creator,
             title,
             description,
-            amount,
             milestone_id,
             yes_votes,
             no_votes,
@@ -507,6 +489,7 @@ pub struct Milestone {
     pub amount: u64,
     pub is_completed: bool,
     pub completed_at: i64,
+    pub has_proposal: bool,
 }
 
 impl Milestone {
@@ -514,7 +497,8 @@ impl Milestone {
         256 + // description
         8 + // amount
         1 + // is_completed
-        8; // completed_at
+        8 + // completed_at
+        1; // has_proposal
 
     pub fn pack(&self, dst: &mut [u8]) {
         let mut offset = 0;
@@ -545,6 +529,10 @@ impl Milestone {
 
         // Pack completed_at
         dst[offset..offset + 8].copy_from_slice(&self.completed_at.to_le_bytes());
+        offset += 8;
+
+        // Pack has_proposal
+        dst[offset] = self.has_proposal as u8;
     }
 
     pub fn unpack(src: &[u8]) -> Result<Self, ProgramError> {
@@ -574,6 +562,10 @@ impl Milestone {
 
         // Unpack completed_at
         let completed_at = i64::from_le_bytes(src[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        // Unpack has_proposal
+        let has_proposal = src[offset] != 0;
 
         Ok(Milestone {
             title,
@@ -581,6 +573,7 @@ impl Milestone {
             amount,
             is_completed,
             completed_at,
+            has_proposal,
         })
     }
 }
@@ -600,6 +593,9 @@ pub enum UnicornFactoryError {
     AlreadyVoted,
     InvalidMilestone,
     MilestoneAlreadyCompleted,
+    VotingPeriodNotEnded,
+    ProposalDidNotPass,
+    MilestoneAlreadyHasProposal,
 }
 
 impl From<UnicornFactoryError> for ProgramError {
@@ -654,7 +650,6 @@ pub fn process_instruction(
         UnicornFactoryInstruction::CreateProposal {
             title,
             description,
-            amount,
             milestone_id,
         } => {
             msg!("Instruction: Create Proposal");
@@ -663,7 +658,6 @@ pub fn process_instruction(
                 accounts,
                 title,
                 description,
-                amount,
                 milestone_id,
             )
         }
@@ -1287,7 +1281,6 @@ fn process_create_proposal(
     accounts: &[AccountInfo],
     title: String,
     description: String,
-    amount: u64,
     milestone_id: u8,
 ) -> ProgramResult {
     msg!("Starting proposal creation");
@@ -1311,9 +1304,15 @@ fn process_create_proposal(
         authority_account.key
     );
 
+    let milestone_account = next_account_info(account_info_iter)?;
+    msg!(
+        "Processing account 3: Milestone Account key: {}",
+        milestone_account.key
+    );
+
     let system_program = next_account_info(account_info_iter)?;
     msg!(
-        "Processing account 3: System Program key: {}",
+        "Processing account 4: System Program key: {}",
         system_program.key
     );
 
@@ -1331,6 +1330,31 @@ fn process_create_proposal(
     if !authority_account.is_signer || authority_account.key != &project.authority {
         msg!("Invalid authority or authority is not signer");
         return Err(UnicornFactoryError::InvalidAuthority.into());
+    }
+
+    // Load and verify milestone
+    let mut milestone_data = milestone_account.data.borrow_mut();
+    let mut milestone = Milestone::unpack(&milestone_data)?;
+
+    // Verify milestone PDA
+    let (expected_milestone_pda, _milestone_bump) = Pubkey::find_program_address(
+        &[b"milestone", project_account.key.as_ref(), &[milestone_id]],
+        program_id,
+    );
+
+    if expected_milestone_pda != *milestone_account.key {
+        msg!(
+            "Invalid milestone account PDA. Expected: {}, Got: {}",
+            expected_milestone_pda,
+            milestone_account.key
+        );
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+    // Check if milestone already has a proposal
+    if milestone.has_proposal {
+        msg!("Milestone {} already has a proposal", milestone_id);
+        return Err(UnicornFactoryError::MilestoneAlreadyHasProposal.into());
     }
 
     // Determine the index for the new proposal
@@ -1398,19 +1422,23 @@ fn process_create_proposal(
         creator: *authority_account.key,
         title: title.clone(),
         description: description.clone(),
-        amount,
         milestone_id,
         yes_votes: 0,
         no_votes: 0,
         is_executed: false,
         created_at: clock.unix_timestamp,
-        voting_end: clock.unix_timestamp + 86400, // 24 hours from now
+        voting_end: clock.unix_timestamp + 180, // 24 hours from now
     };
 
     // Pack proposal data into the new account
     let mut proposal_data_buffer = proposal_account.data.borrow_mut();
     proposal.pack(&mut proposal_data_buffer);
     drop(proposal_data_buffer);
+
+    // Update milestone to indicate it has a proposal
+    milestone.has_proposal = true;
+    milestone.pack(&mut milestone_data);
+    drop(milestone_data);
 
     // Increment proposal count in project account
     project.proposal_count += 1;
@@ -1494,8 +1522,9 @@ fn process_vote(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // Load and verify proposal
-    let mut proposal_data = proposal_account.data.borrow_mut();
+    // Deserialize proposal data
+    let mut proposal_data = proposal_account.try_borrow_mut_data()?;
+    msg!("Proposal account data length: {}", proposal_data.len());
     let mut proposal = Proposal::unpack(&proposal_data)?;
 
     if proposal.is_executed {
@@ -1552,9 +1581,15 @@ fn process_release_funds(
         authority_account.key
     );
 
+    let milestone_account = next_account_info(account_info_iter)?;
+     msg!(
+        "Processing account 3: Milestone Account key: {}",
+        milestone_account.key
+    );
+
     let system_program = next_account_info(account_info_iter)?;
     msg!(
-        "Processing account 3: System Program key: {}",
+        "Processing account 4: System Program key: {}",
         system_program.key
     );
 
@@ -1567,10 +1602,14 @@ fn process_release_funds(
     // Load and verify project
     let project_data = project_account.data.borrow();
     let project = Project::unpack(&project_data)?;
+    
+    // Store the values we need before dropping the borrow
+    let project_authority = project.authority;
+    let project_bump = project.bump;
     drop(project_data);
 
     // Verify authority is project authority and is signer
-    if !authority_account.is_signer || authority_account.key != &project.authority {
+    if !authority_account.is_signer || authority_account.key != &project_authority {
         msg!("Invalid authority or authority is not signer");
         return Err(UnicornFactoryError::InvalidAuthority.into());
     }
@@ -1611,53 +1650,67 @@ fn process_release_funds(
             "Voting period for proposal {} has not ended yet",
             proposal_id
         );
-        return Err(UnicornFactoryError::VotingPeriodEnded.into());
+        return Err(UnicornFactoryError::VotingPeriodNotEnded.into());
     }
 
     // Check if proposal has won (yes votes > no votes)
     if proposal.yes_votes <= proposal.no_votes {
         msg!("Proposal {} did not win the vote", proposal_id);
+        return Err(UnicornFactoryError::ProposalDidNotPass.into());
+    }
+
+     // Load and verify milestone account
+    let mut milestone_data = milestone_account.data.borrow_mut();
+    let mut milestone = Milestone::unpack(&milestone_data)?;
+
+    // Verify milestone PDA using the milestone_id from the proposal
+    let (expected_milestone_pda, _milestone_bump) = Pubkey::find_program_address(
+        &[b"milestone", project_account.key.as_ref(), &[proposal.milestone_id]],
+        program_id,
+    );
+
+     if expected_milestone_pda != *milestone_account.key {
+        msg!(
+            "Invalid milestone account PDA for release. Expected: {}, Got: {}",
+            expected_milestone_pda,
+            milestone_account.key
+        );
+        return Err(ProgramError::IncorrectProgramId);
+    }
+
+
+    // Release funds using manual lamport transfer
+    let amount_to_release = milestone.amount;
+    msg!(
+        "Releasing {} lamports for proposal {}",
+        amount_to_release,
+        proposal_id
+    );
+
+    // Check if project has enough lamports
+    let project_lamports = project_account.lamports();
+    if project_lamports < amount_to_release {
+        msg!("Project insufficient balance to pay back authority");
         return Err(UnicornFactoryError::InvalidAmount.into());
     }
 
-    // Release funds
-    msg!(
-        "Releasing {} lamports for proposal {}",
-        proposal.amount,
-        proposal_id
-    );
-    let amount_to_release = proposal.amount;
+    // Manual lamport transfer
+    **project_account.lamports.borrow_mut() -= amount_to_release;
+    **authority_account.lamports.borrow_mut() += amount_to_release;
 
-    // Transfer SOL from project to authority
-    let project_seeds = &[
-        b"project".as_ref(),
-        project.authority.as_ref(),
-        &[project.bump],
-    ];
-    let signer_seeds = &[&project_seeds[..]];
-
-    invoke_signed(
-        &system_instruction::transfer(
-            project_account.key,
-            authority_account.key,
-            amount_to_release,
-        ),
-        &[
-            project_account.clone(),
-            authority_account.clone(),
-            system_program.clone(),
-        ],
-        signer_seeds,
-    )?;
-
-    msg!("Funds transferred successfully");
-
-    // Update proposal state
+    // Mark proposal as executed
     proposal.is_executed = true;
+
+    msg!("Successfully released {} lamports for proposal {}", amount_to_release, proposal_id);
 
     // Pack updated proposal data
     proposal.pack(&mut proposal_data);
     drop(proposal_data);
+
+    // Mark milestone as completed
+    milestone.is_completed = true;
+    milestone.pack(&mut milestone_data);
+    drop(milestone_data);
 
     msg!(
         "Funds released and proposal {} marked as executed successfully",
@@ -1784,6 +1837,7 @@ fn process_add_milestone(
         amount,
         is_completed: false,
         completed_at: 0,
+        has_proposal: false,
     };
 
     {

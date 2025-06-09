@@ -18,7 +18,6 @@ const PROJECT_ACCOUNT_SIZE = 32 + // authority
 const PROPOSAL_ACCOUNT_SIZE = 32 + // creator
   32 + // title (max 32 bytes)
   256 + // description (max 256 bytes)
-  8 + // amount
   1 + // milestone_id
   8 + // yes_votes
   8 + // no_votes
@@ -50,7 +49,6 @@ export interface Proposal {
   creator: PublicKey;
   title: string;
   description: string;
-  amount: number;
   milestoneId: number;
   yesVotes: number;
   noVotes: number;
@@ -65,6 +63,7 @@ export interface Milestone {
   amount: number;
   isCompleted: boolean;
   completedAt: number;
+  hasProposal: boolean;
 }
 
 export class UnicornFactoryClient {
@@ -588,13 +587,6 @@ export class UnicornFactoryClient {
       // Create transaction with compute budget
       const transaction = new Transaction();
       
-      // Add compute budget instruction FIRST
-      transaction.add(
-        ComputeBudgetProgram.setComputeUnitLimit({
-          units: 400_000, // Increase from default ~200k to 400k
-        })
-      );
-      
       // Then add your existing instruction
       transaction.add(instruction);
 
@@ -638,36 +630,42 @@ export class UnicornFactoryClient {
 
   async createProposal(
     projectPda: PublicKey,
-    proposalIndex: number,
     title: string,
     description: string,
-    amount: number,
     milestoneId: number
   ): Promise<string> {
     console.log('Creating proposal...');
     console.log('Project PDA:', projectPda.toString());
-    console.log('Proposal Index:', proposalIndex);
+    console.log('Title:', title);
+    console.log('Description:', description);
+    console.log('Milestone ID:', milestoneId);
+
+    // Fetch the project to get the current proposal count
+    const project = await this.getProject(projectPda);
+    const proposalIndex = project.proposalCount;
 
     // Find the PDA for the new proposal account
     const [proposalAccountPda, proposalBump] = await PublicKey.findProgramAddress(
-        [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalIndex])],
-        this.programId
+      [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalIndex])],
+      this.programId
     );
     console.log('Proposal PDA:', proposalAccountPda.toString());
 
-    // Convert strings to UTF-8 bytes
+    // Find PDA for the milestone account
+    const [milestonePda, milestoneBump] = await PublicKey.findProgramAddress(
+      [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([milestoneId])],
+      this.programId
+    );
+    console.log('Milestone PDA:', milestonePda.toString());
+
+    // Encode strings to UTF-8 bytes
     const titleBytes = new TextEncoder().encode(title);
     const descriptionBytes = new TextEncoder().encode(description);
 
-    // Create instruction data buffer
-    // 1 (instruction index) + 4 (title len) + 4 (desc len) + title.length + desc.length + 8 (amount) + 1 (milestoneId)
-    const data = Buffer.alloc(1 + 4 + 4 + titleBytes.length + descriptionBytes.length + 8 + 1);
+    // Create instruction data buffer with correct size
+    const data = Buffer.alloc(4 + 4 + titleBytes.length + descriptionBytes.length + 1);
     let offset = 0;
 
-    // Write instruction index (u8)
-    data.writeUInt8(4, offset);
-    offset += 1;
-    
     // Write title length (u32)
     data.writeUInt32LE(titleBytes.length, offset);
     offset += 4;
@@ -676,32 +674,27 @@ export class UnicornFactoryClient {
     data.writeUInt32LE(descriptionBytes.length, offset);
     offset += 4;
 
-    // Write title bytes
+    // Write title bytes (variable length)
     data.set(titleBytes, offset);
     offset += titleBytes.length;
 
-    // Write description bytes
+    // Write description bytes (variable length)
     data.set(descriptionBytes, offset);
     offset += descriptionBytes.length;
 
-    // Write amount (u64)
-    const amountBuffer = Buffer.alloc(8);
-    amountBuffer.writeBigUInt64LE(BigInt(amount));
-    data.set(amountBuffer, offset);
-    offset += 8;
-    
-    // Write milestone ID (u8)
+    // Write milestone_id (u8)
     data.writeUInt8(milestoneId, offset);
-    
+
     const instruction = new TransactionInstruction({
       programId: this.programId,
       keys: [
-        { pubkey: projectPda, isSigner: false, isWritable: true }, // Project account (PDA)
-        { pubkey: proposalAccountPda, isSigner: false, isWritable: true }, // New Proposal account (PDA)
-        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: true }, // Authority account (Signer)
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System program
+        { pubkey: projectPda, isSigner: false, isWritable: true },
+        { pubkey: proposalAccountPda, isSigner: false, isWritable: true },
+        { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: true },
+        { pubkey: milestonePda, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
       ],
-      data,
+      data: Buffer.from([4, ...data]), // 4 is the instruction index
     });
 
     console.log('Instruction prepared:', {
@@ -711,22 +704,19 @@ export class UnicornFactoryClient {
         isSigner: key.isSigner,
         isWritable: key.isWritable
       })),
-      dataLength: instruction.data.length,
-      data: Array.from(instruction.data) // Log data bytes
+      dataLength: instruction.data.length
     });
 
     try {
       console.log('Sending transaction...');
+      // Send ONLY the instruction - let Rust create the account
       const tx = await this.provider.sendAndConfirm(
         new Transaction().add(instruction)
       );
       console.log('Transaction successful:', tx);
       return tx;
-    } catch (error: any) {
+    } catch (error) {
       console.error('Transaction failed:', error);
-      if (error.logs) {
-        console.error('Transaction logs:', error.logs);
-      }
       throw error;
     }
   }
@@ -790,23 +780,25 @@ export class UnicornFactoryClient {
     }
   }
 
-  // FIXED: ReleaseFunds function - consistent with Rust contract
+  // ReleaseFunds function - consistent with Rust contract
   async releaseFunds(
     projectPda: PublicKey,
-    proposalId: number
+    proposalId: number,
+    milestonePda: PublicKey
   ): Promise<string> {
     console.log('Releasing funds for proposal...');
     console.log('Project PDA:', projectPda.toString());
     console.log('Proposal ID:', proposalId);
+    console.log('Milestone PDA:', milestonePda.toString());
 
-    // FIXED: Use single byte like create_proposal (not 8-byte buffer)
+    // Use single byte for proposal ID in PDA derivation
     const [proposalAccountPda, proposalBump] = await PublicKey.findProgramAddress(
         [Buffer.from('proposal'), projectPda.toBuffer(), Buffer.from([proposalId])],
         this.programId
     );
     console.log('Proposal PDA:', proposalAccountPda.toString());
 
-    // Instruction data remains the same as before, containing just the proposal ID
+    // Instruction data contains proposal ID as u64 (8 bytes)
     const data = Buffer.alloc(8);
     data.writeBigUInt64LE(BigInt(proposalId), 0);
 
@@ -816,6 +808,7 @@ export class UnicornFactoryClient {
         { pubkey: projectPda, isSigner: false, isWritable: true }, // Project account (PDA - writable to send SOL)
         { pubkey: proposalAccountPda, isSigner: false, isWritable: true }, // Proposal account (PDA - writable to mark as executed)
         { pubkey: this.provider.wallet.publicKey, isSigner: true, isWritable: true }, // Authority account (Signer, writable to receive SOL)
+        { pubkey: milestonePda, isSigner: false, isWritable: true }, // Milestone account (PDA - writable to update has_proposal flag)
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // System program
       ],
       data: Buffer.from([6, ...data]), // 6 is the instruction index for release funds
@@ -831,10 +824,16 @@ export class UnicornFactoryClient {
       dataLength: instruction.data.length
     });
 
-     try {
+    try {
       console.log('Sending transaction...');
       const tx = await this.provider.sendAndConfirm(
-        new Transaction().add(instruction)
+        new Transaction().add(instruction),
+        [],
+        {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+          commitment: 'confirmed'
+        }
       );
       console.log('Transaction successful:', tx);
       return tx;
@@ -1003,6 +1002,7 @@ export class UnicornFactoryClient {
       console.error('Account info not found for Proposal PDA:', proposalAccountPda.toString());
       throw new Error('Proposal not found');
     }
+    console.log('Proposal Account Data Length:', accountInfo.data.length);
 
     // Parse account data according to the Proposal struct layout
     const data = accountInfo.data;
@@ -1019,10 +1019,6 @@ export class UnicornFactoryClient {
     // Parse description (256 bytes)
     const description = new TextDecoder().decode(data.slice(offset, offset + 256)).replace(/\0/g, '');
     offset += 256;
-    
-    // Parse amount (8 bytes)
-    const amount = Number(data.readBigUInt64LE(offset));
-    offset += 8;
     
     // Parse milestone ID (1 byte)
     const milestoneId = data[offset];
@@ -1044,14 +1040,20 @@ export class UnicornFactoryClient {
     const createdAt = Number(data.readBigInt64LE(offset));
     offset += 8;
     
-    // Parse voting end (8 bytes)
-    const votingEnd = Number(data.readBigInt64LE(offset));
+    console.log(`Debug: Before votingEnd check - offset: ${offset}, data.length: ${data.length}`);
+
+    // Conditionally unpack votingEnd if buffer has enough bytes
+    let votingEnd: number;
+    if (offset + 8 <= data.length) {
+        votingEnd = Number(data.readBigInt64LE(offset));
+    } else {
+        votingEnd = 0; // Default value if votingEnd field is missing
+    }
 
     console.log('Parsed proposal:', {
         creator: creator.toString(),
         title,
         description,
-        amount,
         milestoneId,
         yesVotes,
         noVotes,
@@ -1064,7 +1066,6 @@ export class UnicornFactoryClient {
       creator,
       title,
       description,
-      amount,
       milestoneId,
       yesVotes,
       noVotes,
@@ -1114,6 +1115,10 @@ export class UnicornFactoryClient {
     
     // Parse completed at (8 bytes)
     const completedAt = Number(data.readBigInt64LE(offset));
+    offset += 8;
+
+    // Parse has proposal (1 byte)
+    const hasProposal = Boolean(data[offset]);
 
     console.log('Parsed milestone:', {
         title,
@@ -1121,6 +1126,7 @@ export class UnicornFactoryClient {
         amount,
         isCompleted,
         completedAt,
+        hasProposal,
     });
 
     return {
@@ -1129,6 +1135,7 @@ export class UnicornFactoryClient {
       amount,
       isCompleted,
       completedAt,
+      hasProposal,
     };
   }
 
@@ -1189,9 +1196,6 @@ export class UnicornFactoryClient {
         const description = new TextDecoder().decode(data.slice(offset, offset + 256)).replace(/\0/g, '');
         offset += 256;
 
-        const amount = Number(data.readBigUInt64LE(offset));
-        offset += 8;
-
         const milestoneId = data[offset];
         offset += 1;
 
@@ -1207,13 +1211,18 @@ export class UnicornFactoryClient {
         const createdAt = Number(data.readBigInt64LE(offset));
         offset += 8;
 
-        const votingEnd = Number(data.readBigInt64LE(offset));
+        // Conditionally unpack votingEnd if buffer has enough bytes
+        let votingEnd: number;
+        if (offset + 8 <= data.length) {
+            votingEnd = Number(data.readBigInt64LE(offset));
+        } else {
+            votingEnd = 0; // Default value if votingEnd field is missing
+        }
 
         return {
             creator,
             title,
             description,
-            amount,
             milestoneId,
             yesVotes,
             noVotes,
@@ -1240,6 +1249,9 @@ export class UnicornFactoryClient {
         offset += 1;
 
         const completedAt = Number(data.readBigInt64LE(offset));
+        offset += 8;
+
+        const hasProposal = Boolean(data[offset]);
 
         return {
             title,
@@ -1247,6 +1259,7 @@ export class UnicornFactoryClient {
             amount,
             isCompleted,
             completedAt,
+            hasProposal,
         };
   }
 }

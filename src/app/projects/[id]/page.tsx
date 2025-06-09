@@ -47,6 +47,7 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
   const [sellAmount, setSellAmount] = useState<string>('');
   const [userTokenBalance, setUserTokenBalance] = useState<number>(0);
   const [showCreateProposal, setShowCreateProposal] = useState(false);
+  const [totalReleasedAmount, setTotalReleasedAmount] = useState<number>(0);
 
   // Move fetchProject outside useEffect and wrap with useCallback
   const fetchProject = useCallback(async () => {
@@ -79,6 +80,21 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
         ...projectData,
         tokenDecimals: decimals, // Store decimals with project data
       });
+
+      // Fetch all milestones to calculate total released amount
+      const milestoneCount = projectData.milestoneCount;
+      const milestonePromises = Array.from({ length: milestoneCount }, (_, i) =>
+        client.getMilestone(projectPda, i)
+      );
+      const fetchedMilestones = await Promise.all(milestonePromises);
+
+      let sumReleased = 0;
+      fetchedMilestones.forEach(milestone => {
+        if (milestone.isCompleted) {
+          sumReleased += milestone.amount;
+        }
+      });
+      setTotalReleasedAmount(sumReleased / 1e9); // Convert lamports to SOL
 
       // Fetch user's token balance
       if (projectData.tokenMintAddress) {
@@ -113,6 +129,8 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
   const handleBuyTokens = async () => {
     if (!wallet.connected || !wallet.publicKey || !project) return;
 
+    const loadingToast = toast.loading('Purchasing tokens...');
+
     try {
       const provider = new AnchorProvider(
         connection,
@@ -127,11 +145,13 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
 
       // Ensure the amount is an integer before converting to BigInt implicitly in the client
       if (!Number.isInteger(amount)) {
-         throw new Error("Invalid buy amount. Please enter a valid number.");
+        toast.dismiss(loadingToast);
+        throw new Error("Invalid buy amount. Please enter a valid number.");
       }
 
       await client.buyTokens(projectPda, amount);
       
+      toast.dismiss(loadingToast);
       toast.success('Tokens purchased successfully!');
 
       // Refresh project data and user balance
@@ -139,6 +159,7 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
       setBuyAmount('');
     } catch (err) {
       console.error('Error buying tokens:', err);
+      toast.dismiss(loadingToast);
       toast.error(`Failed to buy tokens: ${err instanceof Error ? err.message : String(err)}`);
       setError(`Failed to buy tokens: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -146,6 +167,8 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
 
   const handleSellTokens = async () => {
     if (!wallet.connected || !wallet.publicKey || !project) return;
+
+    const loadingToast = toast.loading('Selling tokens...');
 
     try {
       const provider = new AnchorProvider(
@@ -161,11 +184,13 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
 
       // Ensure the amount is an integer before converting to BigInt implicitly in the client
       if (!Number.isInteger(amount)) {
-         throw new Error("Invalid sell amount. Please enter a valid number.");
+        toast.dismiss(loadingToast);
+        throw new Error("Invalid sell amount. Please enter a valid number.");
       }
 
       await client.sellTokens(projectPda, amount);
       
+      toast.dismiss(loadingToast);
       toast.success('Tokens sold successfully!');
 
       // Refresh project data and user balance
@@ -173,6 +198,7 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
       setSellAmount('');
     } catch (err) {
       console.error('Error selling tokens:', err);
+      toast.dismiss(loadingToast);
       toast.error(`Failed to sell tokens: ${err instanceof Error ? err.message : String(err)}`);
       setError(`Failed to sell tokens: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -249,8 +275,12 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
                 </span>
               </div>
               <div className="flex justify-between">
+                <span className="text-gray-400">Total Amount Released:</span>
+                <span className="font-semibold">{totalReleasedAmount} SOL</span>
+              </div>
+              <div className="flex justify-between">
                 <span className="text-gray-400">Your Balance:</span>
-                <span className="font-semibold">{userTokenBalance} tokens</span>
+                <span className="font-semibold">{userTokenBalance / (10 ** project.tokenDecimals)} tokens</span>
               </div>
             </div>
 
@@ -343,17 +373,6 @@ const ProjectPage: React.FC<ProjectPageProps> = ({ params }) => {
 
         {/* Milestones Section */}
         <div className="bg-gray-800 rounded-lg shadow-lg p-6">
-          <div className="flex justify-between items-center mb-6">
-            <h2 className="text-2xl font-bold">Milestones</h2>
-            {wallet.publicKey?.equals(project.authority) && (
-              <button
-                onClick={() => {/* Add milestone creation handler */}}
-                className="px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700 transition-colors"
-              >
-                Add Milestone
-              </button>
-            )}
-          </div>
           <MilestonesList projectId={params.id} />
         </div>
       </div>

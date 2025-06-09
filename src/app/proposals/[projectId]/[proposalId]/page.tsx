@@ -19,6 +19,7 @@ const ProposalDetailsPage = () => {
   const proposalId = parseInt(params.proposalId as string);
 
   const [proposal, setProposal] = useState<Proposal | null>(null);
+  const [milestoneAmount, setMilestoneAmount] = useState<number>(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [userVote, setUserVote] = useState<boolean | null>(null);
@@ -47,6 +48,19 @@ const ProposalDetailsPage = () => {
       const fetchedProposal = await client.getProposal(projectPda, proposalId);
       setProposal(fetchedProposal);
 
+      // Log proposal details for debugging button visibility
+      console.log('Fetched Proposal for Buttons:', {
+        isExecuted: fetchedProposal.isExecuted,
+        votingEnd: new Date(fetchedProposal.votingEnd * 1000),
+        yesVotes: fetchedProposal.yesVotes,
+        noVotes: fetchedProposal.noVotes,
+        currentTime: new Date(),
+      });
+
+      // Fetch the associated milestone to get its amount
+      const fetchedMilestone = await client.getMilestone(projectPda, fetchedProposal.milestoneId);
+      setMilestoneAmount(fetchedMilestone.amount);
+
       // TODO: Implement fetching user's vote status if needed
 
     } catch (err) {
@@ -67,6 +81,8 @@ const ProposalDetailsPage = () => {
       return;
     }
 
+    const loadingToast = toast.loading('Voting on proposal...');
+
     try {
       const provider = new AnchorProvider(
         connection,
@@ -77,27 +93,29 @@ const ProposalDetailsPage = () => {
       const projectPda = new PublicKey(projectId);
       
       await client.vote(projectPda, proposalId, vote);
+      toast.dismiss(loadingToast);
       toast.success('Vote recorded successfully');
       
       // Update local state and re-fetch proposal to get updated counts
       setUserVote(vote); // Optimistically update local vote state
       fetchProposal(); // Re-fetch for accurate vote counts
 
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error voting:', err);
-      toast.error('Failed to record vote');
+      toast.dismiss(loadingToast);
+      toast.error(`Failed to record vote: ${err.message || String(err)}`);
     }
   };
 
-    const handleReleaseFunds = async () => {
+  const handleReleaseFunds = async () => {
     if (!wallet.connected || !wallet.publicKey || !proposal || !projectId || isNaN(proposalId)) {
       toast.error('Please connect your wallet and ensure proposal data is loaded to release funds');
       return;
     }
 
-     if (!isProjectOwner) {
-        toast.error('Only the project owner can release funds.');
-        return;
+    if (!isProjectOwner) {
+      toast.error('Only the project owner can release funds.');
+      return;
     }
 
     // Basic check if voting ended and proposal passed (more robust check is in program)
@@ -105,14 +123,16 @@ const ProposalDetailsPage = () => {
     const proposalPassed = proposal.yesVotes > proposal.noVotes;
 
     if (!votingEnded) {
-        toast.error('Voting period has not ended yet.');
-        return;
+      toast.error('Voting period has not ended yet.');
+      return;
     }
 
-     if (!proposalPassed) {
-        toast.error('Proposal did not pass the vote.');
-        return;
+    if (!proposalPassed) {
+      toast.error('Proposal did not pass the vote.');
+      return;
     }
+
+    const loadingToast = toast.loading('Releasing funds...');
 
     try {
       const provider = new AnchorProvider(
@@ -123,18 +143,35 @@ const ProposalDetailsPage = () => {
       const client = new UnicornFactoryClient(provider);
       const projectPda = new PublicKey(projectId);
       
-      await client.releaseFunds(projectPda, proposalId);
+      // Find the milestone PDA
+      const [milestonePda, _milestoneBump] = await PublicKey.findProgramAddress(
+          [Buffer.from('milestone'), projectPda.toBuffer(), Buffer.from([proposal.milestoneId])],
+          client.programId
+      );
+
+      // Add balance check here
+      const projectBalance = await connection.getBalance(projectPda);
+      if (projectBalance < milestoneAmount) {
+        toast.dismiss(loadingToast);
+        toast.error(`Insufficient project funds. Need ${milestoneAmount / 1e9} SOL, have ${projectBalance / 1e9} SOL`);
+        return;
+      }
+
+      await client.releaseFunds(projectPda, proposalId, milestonePda);
+      
+      // Update toast
+      toast.dismiss(loadingToast);
       toast.success('Funds released successfully!');
       
       // Re-fetch proposal to update status
-      fetchProposal();
+      await fetchProposal();
 
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error releasing funds:', err);
-      toast.error('Failed to release funds');
+      toast.dismiss(loadingToast);
+      toast.error(err instanceof Error ? err.message : 'Failed to release funds');
     }
   };
-
 
   if (!wallet.connected) {
     return (
@@ -209,43 +246,14 @@ const ProposalDetailsPage = () => {
         <ProposalCard
           proposal={proposal}
           projectId={projectId}
+          onVote={(_proposalId, vote) => handleVote(vote)}
+          canVote={true}
+          hasVoted={userVote !== null}
+          userVote={userVote}
+          onReleaseFunds={handleReleaseFunds}
+          proposalId={proposalId}
+          milestoneAmount={milestoneAmount}
         />
-
-         {/* Voting Buttons (re-implemented here for single proposal page) */}
-        {!proposal.isExecuted && !votingEnded && wallet.connected && (
-          <div className="flex space-x-4 mt-6">
-            <button
-              onClick={() => handleVote(true)}
-              // disabled={hasVoted} // Placeholder
-              className={
-                'flex-1 px-4 py-2 rounded-lg transition-colors ' +
-                (userVote === true ? 'bg-green-600 text-white cursor-not-allowed' : 'bg-green-500 hover:bg-green-600 text-white')
-              }
-            >
-              Vote Yes
-            </button>
-            <button
-              onClick={() => handleVote(false)}
-              // disabled={hasVoted} // Placeholder
-              className={
-                 'flex-1 px-4 py-2 rounded-lg transition-colors ' +
-                (userVote === false ? 'bg-red-600 text-white cursor-not-allowed' : 'bg-red-500 hover:bg-red-600 text-white')
-              }
-            >
-              Vote No
-            </button>
-          </div>
-        )}
-
-        {/* Release Funds Button */}
-        {!proposal.isExecuted && votingEnded && proposalPassed && isProjectOwner && (
-          <button
-            onClick={handleReleaseFunds}
-            className="w-full mt-4 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
-          >
-            Release Funds ({proposal.amount / 1e9} SOL)
-          </button>
-        )}
 
       </div>
     </div>

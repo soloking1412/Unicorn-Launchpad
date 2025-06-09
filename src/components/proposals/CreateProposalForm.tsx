@@ -18,7 +18,6 @@ const CreateProposalForm: React.FC<CreateProposalFormProps> = ({ projectId, onPr
   const [formData, setFormData] = useState({
     title: '',
     description: '',
-    amount: '',
     milestoneId: '',
   });
 
@@ -38,6 +37,7 @@ const CreateProposalForm: React.FC<CreateProposalFormProps> = ({ projectId, onPr
     }
 
     setLoading(true);
+    const loadingToast = toast.loading('Creating proposal...');
 
     try {
       const provider = new AnchorProvider(
@@ -48,37 +48,55 @@ const CreateProposalForm: React.FC<CreateProposalFormProps> = ({ projectId, onPr
       const client = new UnicornFactoryClient(provider);
       const projectPda = new PublicKey(projectId);
       
-      const amount = parseFloat(formData.amount) * 1e9; // Convert to lamports
       const milestoneId = parseInt(formData.milestoneId);
 
-      // Get the current proposal count
-      const project = await client.getProject(projectPda);
-      const proposalIndex = project.proposalCount;
+      // Check if a proposal already exists for this milestone
+      try {
+        const milestone = await client.getMilestone(projectPda, milestoneId);
+        if (milestone.hasProposal) {
+          toast.dismiss(loadingToast);
+          toast.error(`A proposal for Milestone ID ${milestoneId} already exists.`);
+          setLoading(false);
+          return;
+        }
+      } catch (milestoneErr: any) {
+        // If milestone not found, it's a valid scenario for creation, proceed.
+        // If it's another error, re-throw or handle as appropriate.
+        if (milestoneErr.message !== 'Milestone not found') {
+          toast.dismiss(loadingToast);
+          toast.error(`Error checking milestone: ${milestoneErr.message}`);
+          setLoading(false);
+          return;
+        }
+      }
+
+      // Get the current proposal count (now handled by program.ts's createProposal)
+      // const project = await client.getProject(projectPda);
+      // const proposalIndex = project.proposalCount;
 
       await client.createProposal(
         projectPda,
-        proposalIndex,
         formData.title,
         formData.description,
-        amount,
         milestoneId
       );
 
+      toast.dismiss(loadingToast);
       toast.success('Proposal created successfully');
       
       // Reset form
       setFormData({
         title: '',
         description: '',
-        amount: '',
         milestoneId: '',
       });
 
       // Notify parent component
       onProposalCreated();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error creating proposal:', err);
-      toast.error('Failed to create proposal');
+      toast.dismiss(loadingToast);
+      toast.error(`Failed to create proposal: ${err.message || String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -117,24 +135,6 @@ const CreateProposalForm: React.FC<CreateProposalFormProps> = ({ projectId, onPr
           rows={4}
           className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
           placeholder="Enter proposal description"
-        />
-      </div>
-
-      <div>
-        <label htmlFor="amount" className="block text-sm font-medium text-gray-300 mb-1">
-          Amount (SOL)
-        </label>
-        <input
-          type="number"
-          id="amount"
-          name="amount"
-          value={formData.amount}
-          onChange={handleInputChange}
-          required
-          min="0"
-          step="0.1"
-          className="w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
-          placeholder="Enter amount in SOL"
         />
       </div>
 
