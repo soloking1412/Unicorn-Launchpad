@@ -14,7 +14,6 @@ interface Proposal {
   creator: PublicKey;
   title: string;
   description: string;
-  amount: number;
   milestoneId: number;
   yesVotes: number;
   noVotes: number;
@@ -31,6 +30,7 @@ const ProposalsPage = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [userVotes, setUserVotes] = useState<Record<string, boolean>>({});
+  const [milestoneAmounts, setMilestoneAmounts] = useState<Record<string, number>>({});
 
   useEffect(() => {
     fetchAllProposals();
@@ -55,6 +55,8 @@ const ProposalsPage = () => {
       
       // Fetch proposals for each project
       const allProposals: Proposal[] = [];
+      const milestoneAmounts: Record<string, number> = {};
+      
       for (const project of projects) {
         const projectPda = await client.getProjectPda(project.authority);
         const proposalCount = project.proposalCount;
@@ -64,6 +66,13 @@ const ProposalsPage = () => {
           client.getProposal(projectPda, i)
         );
         const projectProposals = await Promise.all(proposalPromises);
+        
+        // Fetch milestone amounts for each proposal
+        for (const proposal of projectProposals) {
+          const milestone = await client.getMilestone(projectPda, proposal.milestoneId);
+          const key = `${projectPda.toString()}-${proposal.milestoneId}`;
+          milestoneAmounts[key] = milestone.amount;
+        }
         
         // Add project ID to each proposal
         const proposalsWithProjectId = projectProposals.map(p => ({
@@ -78,6 +87,7 @@ const ProposalsPage = () => {
       allProposals.sort((a, b) => b.createdAt - a.createdAt);
       
       setProposals(allProposals);
+      setMilestoneAmounts(milestoneAmounts);
     } catch (err) {
       console.error('Error fetching proposals:', err);
       setError('Failed to load proposals');
@@ -192,6 +202,8 @@ const ProposalsPage = () => {
                   canVote={wallet.connected && !proposal.isExecuted}
                   hasVoted={proposal.projectId ? `${proposal.projectId}-${index}` in userVotes : false}
                   userVote={proposal.projectId ? userVotes[`${proposal.projectId}-${index}`] : null}
+                  proposalId={index}
+                  milestoneAmount={milestoneAmounts[`${proposal.projectId}-${proposal.milestoneId}`] || 0}
                 />
               </div>
             ))}

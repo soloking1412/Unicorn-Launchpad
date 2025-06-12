@@ -1,8 +1,7 @@
-import { Wallet as AnchorWallet } from '@project-serum/anchor';
 import { WalletContextState } from '@solana/wallet-adapter-react';
 import { PublicKey, Transaction } from '@solana/web3.js';
 
-export class SolanaWallet implements AnchorWallet {
+export class SolanaWallet {
   constructor(private wallet: WalletContextState) {}
 
   get publicKey(): PublicKey {
@@ -18,9 +17,5 @@ export class SolanaWallet implements AnchorWallet {
   async signAllTransactions(txs: Transaction[]): Promise<Transaction[]> {
     if (!this.wallet.signAllTransactions) throw new Error('Wallet not connected');
     return await this.wallet.signAllTransactions(txs);
-  }
-
-  get payer(): PublicKey {
-    return this.publicKey;
   }
 } 
